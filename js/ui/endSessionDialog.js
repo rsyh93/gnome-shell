@@ -18,7 +18,7 @@
  */
 
 const { AccountsService, Clutter, Gio,
-        GLib, GObject, Pango, Polkit, Shell, St }  = imports.gi;
+        GLib, GObject, Pango, Polkit, Shell, St, UPowerGlib: UPower }  = imports.gi;
 
 const CheckBox = imports.ui.checkBox;
 const Dialog = imports.ui.dialog;
@@ -47,6 +47,7 @@ const logoutDialogContent = {
                         seconds).format(seconds);
     },
     showBatteryWarning: false,
+    isSystemUpgrade: false,
     confirmButtons: [{ signal: 'ConfirmedLogout',
                        label: C_("button", "Log Out") }],
     showOtherSessions: false,
@@ -62,6 +63,7 @@ const shutdownDialogContent = {
     },
     checkBoxText: C_("checkbox", "Install pending software updates"),
     showBatteryWarning: true,
+    isSystemUpgrade: false,
     confirmButtons: [{ signal: 'ConfirmedReboot',
                        label: C_("button", "Restart") },
                      { signal: 'ConfirmedShutdown',
@@ -78,6 +80,7 @@ const restartDialogContent = {
                         seconds).format(seconds);
     },
     showBatteryWarning: false,
+    isSystemUpgrade: false,
     confirmButtons: [{ signal: 'ConfirmedReboot',
                        label: C_("button", "Restart") }],
     iconName: 'view-refresh-symbolic',
@@ -93,6 +96,7 @@ const restartUpdateDialogContent = {
                         seconds).format(seconds);
     },
     showBatteryWarning: true,
+    isSystemUpgrade: false,
     confirmButtons: [{ signal: 'ConfirmedReboot',
                        label: C_("button", "Restart &amp; Install") }],
     unusedFutureButtonForTranslation: C_("button", "Install &amp; Power Off"),
@@ -112,6 +116,7 @@ const restartUpgradeDialogContent = {
     },
     disableTimer: true,
     showBatteryWarning: false,
+    isSystemUpgrade: true,
     confirmButtons: [{ signal: 'ConfirmedReboot',
                        label: C_("button", "Restart &amp; Install") }],
     iconName: 'view-refresh-symbolic',
@@ -142,7 +147,7 @@ const LogindSession = Gio.DBusProxy.makeProxyWrapper(LogindSessionIface);
 const PkOfflineIface = loadInterfaceXML('org.freedesktop.PackageKit.Offline');
 const PkOfflineProxy = Gio.DBusProxy.makeProxyWrapper(PkOfflineIface);
 
-const UPowerIface = loadInterfaceXML('org.freedesktop.UPower');
+const UPowerIface = loadInterfaceXML('org.freedesktop.UPower.Device');
 const UPowerProxy = Gio.DBusProxy.makeProxyWrapper(UPowerIface);
 
 function findAppFromInhibitor(inhibitor) {
@@ -224,7 +229,7 @@ class EndSessionDialog extends ModalDialog.ModalDialog {
 
         this._powerProxy = new UPowerProxy(Gio.DBus.system,
                                            'org.freedesktop.UPower',
-                                           '/org/freedesktop/UPower',
+                                           '/org/freedesktop/UPower/devices/DisplayDevice',
                                            (proxy, error) => {
                                                if (error) {
                                                    log(error.message);
@@ -256,7 +261,7 @@ class EndSessionDialog extends ModalDialog.ModalDialog {
 
         this._batteryWarning = new St.Label({
             style_class: 'end-session-dialog-battery-warning',
-            text: _('Running on battery power: Please plug in before installing updates.'),
+            text: _('Low battery power: please plug in before installing updates.'),
         });
         this._batteryWarning.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
         this._batteryWarning.clutter_text.line_wrap = true;
@@ -306,6 +311,16 @@ class EndSessionDialog extends ModalDialog.ModalDialog {
         this._user.disconnect(this._userChangedId);
     }
 
+    _isDischargingBattery() {
+        return this._powerProxy.IsPresent &&
+               this._powerProxy.State !== UPower.DeviceState.CHARGING &&
+               this._powerProxy.State !== UPower.DeviceState.FULLY_CHARGED;
+    }
+
+    _isBatteryLow() {
+        return this._isDischargingBattery() && this._powerProxy.Percentage < 30;
+    }
+
     _sync() {
         let open = this.state == ModalDialog.State.OPENING || this.state == ModalDialog.State.OPENED;
         if (!open)
@@ -319,10 +334,9 @@ class EndSessionDialog extends ModalDialog.ModalDialog {
         if (dialogContent.subjectWithUpdates && this._checkBox.checked)
             subject = dialogContent.subjectWithUpdates;
 
-        if (dialogContent.showBatteryWarning) {
-            this._batteryWarning.visible =
-                this._powerProxy.OnBattery && this._checkBox.checked;
-        }
+        // Hide battery warning if the user has plugged in.
+        if (this._batteryWarning.visible)
+            this._batteryWarning.visible = this._isDischargingBattery();
 
         let description;
         let displayTime = _roundSecondsToInterval(this._totalSecondsToStayOpen,
@@ -677,13 +691,18 @@ class EndSessionDialog extends ModalDialog.ModalDialog {
 
         _setCheckBoxLabel(this._checkBox, dialogContent.checkBoxText || '');
         this._checkBox.visible = dialogContent.checkBoxText && updatePrepared && updatesAllowed;
-        this._checkBox.checked = this._checkBox.visible;
+
+        if (dialogContent.isSystemUpgrade)
+            this._checkBox.checked = this._checkBox.visible && updateTriggered && !this._isDischargingBattery();
+        else
+            this._checkBox.checked = this._checkBox.visible && !this._isBatteryLow();
 
         // We show the warning either together with the checkbox, or when
         // updates have already been triggered, but the user doesn't have
         // enough permissions to cancel them.
         this._batteryWarning.visible = dialogContent.showBatteryWarning &&
-                                        (this._checkBox.visible || updatePrepared && updateTriggered && !updatesAllowed);
+                                       this._isBatteryLow() &&
+                                       (this._checkBox.visible || updatePrepared && updateTriggered && !updatesAllowed);
 
         this._updateButtons();
 
